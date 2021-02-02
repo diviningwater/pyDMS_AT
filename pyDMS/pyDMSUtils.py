@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 import scipy.ndimage as ndi
+from numba import njit, stencil
 
 from osgeo import gdal
 
@@ -76,54 +77,66 @@ def pix2point(pix, gt):
 
 
 # save the data to geotiff or memory
-def saveImg(data, geotransform, proj, outPath, noDataValue=np.nan, fieldNames=[]):
+def saveImg(data, geotransform, proj, outPath, noDataValue=None, fieldNames=[]):
 
-    # Start the gdal driver for GeoTIFF
-    if outPath == "MEM":
-        driver = gdal.GetDriverByName("MEM")
-        driverOpt = []
-        is_netCDF = False
-    else:
-        # If the output file has .nc extension then save it as netCDF,
-        # otherwise assume that the output should be a GeoTIFF
-        ext = os.path.splitext(outPath)[1]
-        if ext.lower() == ".nc":
-            driver = gdal.GetDriverByName("netCDF")
-            driverOpt = ["FORMAT=NC2"]
-            is_netCDF = True
-        else:
-            driver = gdal.GetDriverByName("GTiff")
-            driverOpt = ['COMPRESS=DEFLATE', 'PREDICTOR=1', 'BIGTIFF=IF_SAFER']
-            is_netCDF = False
-
+    # Save to memory first
+    is_netCDF = False
+    memDriver = gdal.GetDriverByName("MEM")
     shape = data.shape
     if len(shape) > 2:
-        ds = driver.Create(outPath, shape[1], shape[0], shape[2], gdal.GDT_Float32, driverOpt)
+        ds = memDriver.Create("MEM", shape[1], shape[0], shape[2], gdal.GDT_Float32)
         ds.SetProjection(proj)
         ds.SetGeoTransform(geotransform)
         for i in range(shape[2]):
             ds.GetRasterBand(i+1).WriteArray(data[:, :, i])
-            ds.GetRasterBand(i+1).SetNoDataValue(noDataValue)
     else:
-        ds = driver.Create(outPath, shape[1], shape[0], 1, gdal.GDT_Float32, driverOpt)
+        ds = memDriver.Create("MEM", shape[1], shape[0], 1, gdal.GDT_Float32)
         ds.SetProjection(proj)
         ds.SetGeoTransform(geotransform)
         ds.GetRasterBand(1).WriteArray(data)
-        ds.GetRasterBand(1).SetNoDataValue(noDataValue)
 
-    # In case of netCDF format use netCDF4 module to assign proper names
-    # to variables (GDAL can't do this). Also it seems that GDAL has
-    # problems assigning projection to all the bands so fix that.
-    if is_netCDF and fieldNames:
-        from netCDF4 import Dataset
-        ds = None
-        ds = Dataset(outPath, 'a')
-        grid_mapping = ds["Band1"].grid_mapping
-        for i, field in enumerate(fieldNames):
-            ds.renameVariable("Band"+str(i+1), field)
-            ds[field].grid_mapping = grid_mapping
-        ds.close()
-        ds = gdal.Open('NETCDF:"'+outPath+'":'+fieldNames[0])
+    # Save to file if required
+    if outPath == "MEM":
+        if noDataValue is None:
+            noDataValue = np.nan
+        ds.GetRasterBand(1).SetNoDataValue(noDataValue)
+    else:
+        # If the output file has .nc extension then save it as netCDF,
+        # otherwise assume that the output should be a GeoTIFF (COG)
+        ext = os.path.splitext(outPath)[1]
+        if ext.lower() == ".nc":
+            fileFormat = "netCDF"
+            driverOpt = ["FORMAT=NC2"]
+            is_netCDF = True
+        else:
+            fileFormat = "COG"
+            driverOpt = ['COMPRESS=DEFLATE', 'PREDICTOR=YES', 'BIGTIFF=IF_SAFER']
+        out_ds = gdal.Translate(outPath, ds, format=fileFormat, creationOptions=driverOpt,
+                                noData=noDataValue, stats=True)
+        # If GDAL driers for other formats do not exist then default to GeoTiff
+        if out_ds is None:
+            print("Warning: Selected GDAL driver is not supported! Saving as GeoTiff!")
+            fileFormat = "GTiff"
+            driverOpt = ['COMPRESS=DEFLATE', 'PREDICTOR=1', 'BIGTIFF=IF_SAFER']
+            is_netCDF = False
+            ds = gdal.Translate(outPath, ds, format=fileFormat, creationOptions=driverOpt,
+                                noData=noDataValue, stats=True)
+        else:
+            ds = out_ds
+
+        # In case of netCDF format use netCDF4 module to assign proper names
+        # to variables (GDAL can't do this). Also it seems that GDAL has
+        # problems assigning projection to all the bands so fix that.
+        if is_netCDF and fieldNames:
+            from netCDF4 import Dataset
+            ds = None
+            ds = Dataset(outPath, 'a')
+            grid_mapping = ds["Band1"].grid_mapping
+            for i, field in enumerate(fieldNames):
+                ds.renameVariable("Band"+str(i+1), field)
+                ds[field].grid_mapping = grid_mapping
+            ds.close()
+            ds = gdal.Open('NETCDF:"'+outPath+'":'+fieldNames[0])
 
     print('Saved ' + outPath)
 
@@ -168,7 +181,7 @@ def appendNpArray(array, data, axis=None):
 def reprojectSubsetLowResScene(highResScene, lowResScene, resampleAlg=gdal.GRA_Bilinear):
 
     # Read the required metadata
-    proj_HR, gt_HR, xsize_HR, ysize_HR = getRasterInfo(highResScene)[0:4]
+    proj_HR, gt_HR, xsize_HR, ysize_HR, extent = getRasterInfo(highResScene)[0:5]
 
     # Reproject low res scene to high res scene's projection to get the original
     # pixel size in the new projection
@@ -178,30 +191,18 @@ def reprojectSubsetLowResScene(highResScene, lowResScene, resampleAlg=gdal.GRA_B
                     dstSRS=proj_HR,
                     resampleAlg=gdal.GRA_NearestNeighbour)
 
-    # Make the new LR pixel as close as possible to original low resolution while
-    # overlapping nicely with the high resolution pixels
-    gt_LR = out.GetGeoTransform()
-    pixSize_HR = [gt_HR[1], math.fabs(gt_HR[5])]
-    pixSize_LR = [round(gt_LR[1]/pixSize_HR[0])*pixSize_HR[0],
-                  round(math.fabs(gt_LR[5])/pixSize_HR[0])*pixSize_HR[0]]
-    out = None
+    # Now subset to high resolution scene extent while not shifting pixels
+    gt_LR = getRasterInfo(out)[1]
 
-    # Make the extent such that it does not go outside high resolution extent so that the matrix
-    # is the same size as resampled high resolution reflectances in the next step
-    UL = [gt_HR[0], gt_HR[3]]
-    xsize_LR = int((xsize_HR*pixSize_HR[0])/pixSize_LR[0])
-    ysize_LR = int((ysize_HR*pixSize_HR[1])/pixSize_LR[1])
-    BR = [UL[0] + xsize_LR*pixSize_LR[0], UL[1] - ysize_LR*pixSize_LR[1]]
+    UL = pix2point(point2pix([extent[0], extent[3]], gt_LR, upperBound=False), gt_LR)
+    BR = pix2point(point2pix([extent[2], extent[1]], gt_LR, upperBound=True), gt_LR)
 
-    # Call GDAL warp to reproject and subsset low resolution scene
     out = gdal.Warp("",
-                    lowResScene.GetDescription(),
+                    out,
                     format="MEM",
                     dstSRS=proj_HR,
-                    xRes=pixSize_LR[0],
-                    yRes=pixSize_LR[1],
-                    outputBounds=[UL[0], BR[1], BR[0], UL[1]],
-                    resampleAlg=resampleAlg)
+                    resampleAlg=gdal.GRA_NearestNeighbour,
+                    outputBounds=[UL[0], BR[1], BR[0], UL[1]])
 
     return out
 
@@ -212,25 +213,51 @@ def resampleHighResToLowRes(highResScene, lowResScene):
 
     gt_HR = getRasterInfo(highResScene)[1]
     gt_LR, xSize_LR, ySize_LR = getRasterInfo(lowResScene)[1:4]
+    xRes_HR = gt_HR[1]
+    yRes_HR = abs(gt_HR[5])
+    xRes_LR = gt_LR[1]
+    yRes_LR = gt_LR[5]
 
     aggregatedMean = np.zeros((ySize_LR,
                                xSize_LR,
                                highResScene.RasterCount))
     aggregatedStd = np.zeros(aggregatedMean.shape)
 
-    # Calculate how many high res pixels are grouped in a low res pixel
-    pixGroup = [int(gt_LR[5]/gt_HR[5]), int(gt_LR[1]/gt_HR[1])]
-
     # Go through all the high res bands and calculate mean and standard
     # deviation when aggregated to the low resolution
     for band in range(highResScene.RasterCount):
-        data_HR = highResScene.GetRasterBand(band+1).ReadAsArray(0, 0, pixGroup[1]*xSize_LR,
-                                                                 pixGroup[0]*ySize_LR).astype(float)
-        no_data = highResScene.GetRasterBand(band+1).GetNoDataValue()
-        data_HR[data_HR == no_data] = np.nan
-        t = data_HR.reshape(ySize_LR, pixGroup[0], xSize_LR, pixGroup[1])
-        t = t.transpose(0, 2, 1, 3).reshape(ySize_LR, xSize_LR, pixGroup[0]*pixGroup[1])
-        aggregatedMean[:, :, band] = np.nanmean(t, axis=-1)
-        aggregatedStd[:, :, band] = np.nanstd(t, axis=-1)
+        bandData_HR = highResScene.GetRasterBand(band+1).ReadAsArray()
+        aggregatedMean[:, :, band], aggregatedStd[:, :, band] =\
+            _resampleHighResToLowRes(bandData_HR, ySize_LR, yRes_LR, yRes_HR, xSize_LR, xRes_LR,
+                                     xRes_HR, gt_HR, gt_LR)
+    return aggregatedMean, aggregatedStd
+
+
+@njit
+def _resampleHighResToLowRes(bandData_HR, ySize_LR, yRes_LR, yRes_HR, xSize_LR, xRes_LR, xRes_HR,
+                             gt_HR, gt_LR):
+    aggregatedMean = np.zeros((ySize_LR, xSize_LR))
+    aggregatedStd = np.zeros((ySize_LR, xSize_LR))
+    for yPix_LR in range(ySize_LR):
+        yPos_LR_min = gt_LR[3] + yPix_LR*yRes_LR
+        yPix_HR_min = int(round(max(0, gt_HR[3] - yPos_LR_min) / yRes_HR))
+        yPix_HR_max = int(round(max(0, gt_HR[3] - (yPos_LR_min + yRes_LR)) / yRes_HR))
+        for xPix_LR in range(xSize_LR):
+            xPos_LR_min = gt_LR[0] + xPix_LR*xRes_LR
+            xPix_HR_min = int(round(max(0, xPos_LR_min - gt_HR[0]) / xRes_HR))
+            xPix_HR_max = int(round(max(0, xPos_LR_min + xRes_LR - gt_HR[0]) / xRes_HR))
+            aggregatedMean[yPix_LR, xPix_LR] =\
+                np.nanmean(bandData_HR[yPix_HR_min:yPix_HR_max, xPix_HR_min:xPix_HR_max])
+            aggregatedStd[yPix_LR, xPix_LR] =\
+                np.nanstd(bandData_HR[yPix_HR_min:yPix_HR_max, xPix_HR_min:xPix_HR_max])
 
     return aggregatedMean, aggregatedStd
+
+
+@stencil(cval=1.0)
+def removeEdgeNaNs(a):
+    if np.isnan(a[0, 0]) and (not np.isnan(a[-1, 0]) or not np.isnan(a[1, 0]) or
+                              not np.isnan(a[0, -1]) or not np.isnan(a[0, 1])):
+        return np.nanmean(np.array([a[-1, 0], a[1, 0], a[0, -1], a[0, 1]]))
+    else:
+        return a[0, 0]

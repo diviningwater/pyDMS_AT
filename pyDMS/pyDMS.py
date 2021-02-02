@@ -516,13 +516,15 @@ class DecisionTreeSharpener(object):
             outWindowScene = utils.saveImg(outWindowData,
                                            highResFile.GetGeoTransform(),
                                            highResFile.GetProjection(),
-                                           "MEM")
+                                           "MEM",
+                                           noDataValue=np.nan)
             windowedResidual, _, _ = self._calculateResidual(outWindowScene, lowResScene)
             outWindowScene = None
             outFullScene = utils.saveImg(outFullData,
                                          highResFile.GetGeoTransform(),
                                          highResFile.GetProjection(),
-                                         "MEM")
+                                         "MEM",
+                                         noDataValue=np.nan)
             fullResidual, _, _ = self._calculateResidual(outFullScene, lowResScene)
             outFullScene = None
             lowResScene = None
@@ -542,7 +544,8 @@ class DecisionTreeSharpener(object):
         outImage = utils.saveImg(outData,
                                  highResFile.GetGeoTransform(),
                                  highResFile.GetProjection(),
-                                 "MEM")
+                                 "MEM",
+                                 noDataValue=np.nan)
 
         highResFile = None
         inData = None
@@ -602,7 +605,8 @@ class DecisionTreeSharpener(object):
                 correctedImage = utils.saveImg(corrected,
                                                scene_HR.GetGeoTransform(),
                                                scene_HR.GetProjection(),
-                                               "MEM")
+                                               "MEM",
+                                               noDataValue=np.nan)
             else:
                 correctedImage = None
             # Convert residual back to temperature for easier visualisation
@@ -613,14 +617,16 @@ class DecisionTreeSharpener(object):
                 correctedImage = utils.saveImg(corrected,
                                                scene_HR.GetGeoTransform(),
                                                scene_HR.GetProjection(),
-                                               "MEM")
+                                               "MEM",
+                                               noDataValue=np.nan)
             else:
                 correctedImage = None
 
         residualImage = utils.saveImg(residual_LR,
                                       gt_res,
                                       scene_HR.GetProjection(),
-                                      "MEM")
+                                      "MEM",
+                                      noDataValue=np.nan)
 
         print("LR residual bias: "+str(np.nanmean(residual_LR)))
         print("LR residual RMSD: "+str(np.nanmean(residual_LR**2)**0.5))
@@ -708,7 +714,8 @@ class DecisionTreeSharpener(object):
             radianceScene = utils.saveImg(downscaledScene.GetRasterBand(1).ReadAsArray()**4,
                                           downscaledScene.GetGeoTransform(),
                                           downscaledScene.GetProjection(),
-                                          "MEM")
+                                          "MEM",
+                                          noDataValue=np.nan)
             resMean, _ = utils.resampleHighResToLowRes(radianceScene,
                                                        subsetScene_LR)
             # Find the residual (difference) between the two)
@@ -722,17 +729,16 @@ class DecisionTreeSharpener(object):
         # Smooth the residual and resample to high resolution
         residual = utils.binomialSmoother(residual_LR)
         residualDs = utils.saveImg(residual, subsetScene_LR.GetGeoTransform(),
-                                   subsetScene_LR.GetProjection(), "MEM")
-        residualScene_NN = utils.resampleWithGdalWarp(residualDs, downscaledScene,
-                                                      resampleAlg="near")
+                                   subsetScene_LR.GetProjection(), "MEM", noDataValue=np.nan)
         residualScene_BL = utils.resampleWithGdalWarp(residualDs, downscaledScene,
                                                       resampleAlg="bilinear")
         residualDs = None
 
-        # Bilinear resampling extrapolates by half a pixel, so need to clean it up
         residual = residualScene_BL.GetRasterBand(1).ReadAsArray()
-        residual[np.isnan(residualScene_NN.GetRasterBand(1).ReadAsArray())] = np.NaN
-        residualScene_NN = None
+        # Sometimes there can be 1 HR pixel NaN border arond LR invalid pixels due to resampling.
+        # Fuction below fixes this. Image border pixels are excluded due to numba stencil
+        # limitations.
+        residual[1:-1, 1:-1] = utils.removeEdgeNaNs(residual)[1:-1, 1:-1]
         residualScene_BL = None
 
         # The residual array might be slightly smaller then the downscaled because
